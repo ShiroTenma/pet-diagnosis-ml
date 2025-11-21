@@ -2,10 +2,20 @@ import json
 from pathlib import Path
 from time import time
 
-import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
+try:
+    import torch
+    from torch import nn, optim
+    from torch.utils.data import DataLoader
+    from torchvision import datasets, transforms, models
+except Exception:
+    # If imports fail (e.g. editor linting or missing packages), set to None and handle at runtime.
+    torch = None  # type: ignore
+    nn = None
+    optim = None
+    DataLoader = None
+    datasets = None
+    transforms = None
+    models = None
 
 
 # ========== CONFIG ==========
@@ -146,13 +156,18 @@ def evaluate(model, loader, criterion, device):
         outputs = model(images)
         loss = criterion(outputs, labels)
 
-        running_loss += loss.item() * images.size(0)
-        _, preds = torch.max(outputs, 1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+def main():
+    if torch is None:
+        print("❌ PyTorch (torch) tidak terpasang atau tidak dapat diimpor.")
+        print("   Install dengan: pip install torch torchvision  (atau lihat dokumentasi instalasi PyTorch untuk CUDA)")
+        return
 
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
+    device = get_device()
+
+    if not TRAIN_DIR.exists() or not VAL_DIR.exists():
+        print("❌ Folder train/ atau val/ tidak ditemukan.")
+        print("   Pastikan struktur: data/train/<kelas> dan data/val/<kelas>")
+        return
     return epoch_loss, epoch_acc
 
 
