@@ -2,20 +2,10 @@ import json
 from pathlib import Path
 from time import time
 
-try:
-    import torch
-    from torch import nn, optim
-    from torch.utils.data import DataLoader
-    from torchvision import datasets, transforms, models
-except Exception:
-    # If imports fail (e.g. editor linting or missing packages), set to None and handle at runtime.
-    torch = None  # type: ignore
-    nn = None
-    optim = None
-    DataLoader = None
-    datasets = None
-    transforms = None
-    models = None
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
 
 
 # ========== CONFIG ==========
@@ -25,31 +15,38 @@ TRAIN_DIR = DATA_DIR / "train"
 VAL_DIR = DATA_DIR / "val"
 
 IMG_SIZE = 224
-BATCH_SIZE = 8          # kecil biar muat di MX130
-NUM_EPOCHS = 10         # bisa dinaikkan kalau masih kuat
+BATCH_SIZE = 8          # aman untuk MX130 / CPU
+NUM_EPOCHS = 25         # nanti dihentikan lebih awal oleh early stopping
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 2
+
+EARLY_STOP_PATIENCE = 5  # berhenti kalau val loss tidak membaik 5 epoch
 
 MODEL_PATH = BASE_DIR / "pet_skin_resnet18.pth"
 LABELS_PATH = BASE_DIR / "labels.json"
 # ============================
 
 
-def get_device():
+def get_device() -> torch.device:
     if torch.cuda.is_available():
-        print(f"✅ Using GPU: {torch.cuda.get_device_name(0)}")
+        name = torch.cuda.get_device_name(0)
+        print(f"✅ Using GPU: {name}")
         return torch.device("cuda")
     else:
         print("⚠️  GPU tidak terdeteksi, pakai CPU (lebih lambat).")
         return torch.device("cpu")
 
 
-def create_dataloaders():
-    # augmentasi buat train
+def create_dataloaders(device: torch.device):
+    # augmentasi untuk train
     train_tfms = transforms.Compose([
         transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2
+        ),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],   # ImageNet mean
@@ -57,7 +54,7 @@ def create_dataloaders():
         ),
     ])
 
-    # val lebih simpel, tanpa augment
+    # transform untuk val (tanpa augmentasi)
     val_tfms = transforms.Compose([
         transforms.Resize(IMG_SIZE + 32),
         transforms.CenterCrop(IMG_SIZE),
@@ -71,18 +68,29 @@ def create_dataloaders():
     train_ds = datasets.ImageFolder(TRAIN_DIR, transform=train_tfms)
     val_ds = datasets.ImageFolder(VAL_DIR, transform=val_tfms)
 
-    # simpan mapping label → index (supaya dipakai di Android nanti)
+    # simpan mapping index -> nama kelas
     idx_to_class = {idx: cls for cls, idx in train_ds.class_to_idx.items()}
     with LABELS_PATH.open("w", encoding="utf-8") as f:
         json.dump(idx_to_class, f, indent=2)
     print("Label mapping:", idx_to_class)
+
+    # hitung class weights dari distribusi target di train
+    targets = torch.tensor(train_ds.targets)
+    class_counts = torch.bincount(targets)
+    class_weights = 1.0 / class_counts.float()  # bobot lebih besar untuk kelas minoritas
+    class_weights = class_weights / class_weights.sum() * len(class_counts)
+
+    print("Class counts :", class_counts.tolist())
+    print("Class weights:", class_weights.tolist())
+
+    pin = device.type == "cuda"
 
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        pin_memory=True
+        pin_memory=pin,
     )
 
     val_loader = DataLoader(
@@ -90,25 +98,26 @@ def create_dataloaders():
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
-        pin_memory=True
+        pin_memory=pin,
     )
 
-    return train_loader, val_loader, len(train_ds.classes)
+    return train_loader, val_loader, len(train_ds.classes), class_weights
 
 
-def create_model(num_classes: int, device: torch.device):
-    # pakai ResNet18 pretrained
+def create_model(num_classes: int, device: torch.device) -> nn.Module:
+    # ResNet18 pretrained ImageNet
     try:
         weights = models.ResNet18_Weights.IMAGENET1K_V1
         model = models.resnet18(weights=weights)
     except Exception:
+        # fallback untuk versi torchvision lama
         model = models.resnet18(pretrained=True)
 
-    # freeze semua layer dulu
+    # freeze semua layer
     for param in model.parameters():
         param.requires_grad = False
 
-    # ganti FC terakhir untuk 4 kelas kita
+    # ganti fully-connected terakhir
     in_features = model.fc.in_features
     model.fc = nn.Linear(in_features, num_classes)
 
@@ -123,8 +132,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     total = 0
 
     for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
         outputs = model(images)
@@ -150,8 +159,8 @@ def evaluate(model, loader, criterion, device):
     total = 0
 
     for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         outputs = model(images)
         loss = criterion(outputs, labels)
@@ -174,17 +183,22 @@ def main():
         print("   Pastikan struktur: data/train/<kelas> dan data/val/<kelas>")
         return
 
-    train_loader, val_loader, num_classes = create_dataloaders()
+    train_loader, val_loader, num_classes, class_weights = create_dataloaders(device)
     print(f"Jumlah kelas: {num_classes}")
 
     model = create_model(num_classes, device)
-    criterion = nn.CrossEntropyLoss()
+
+    class_weights = class_weights.to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.fc.parameters(), lr=LEARNING_RATE)
 
+    best_val_loss = float("inf")
     best_val_acc = 0.0
+    no_improve_epochs = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
         start = time()
+
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
@@ -200,11 +214,21 @@ def main():
             f"({dur:.1f}s)"
         )
 
-        # simpan model terbaik
-        if val_acc > best_val_acc:
+        # cek perbaikan val_loss untuk early stopping
+        if val_loss < best_val_loss - 1e-4:
+            best_val_loss = val_loss
             best_val_acc = val_acc
+            no_improve_epochs = 0
+
             torch.save(model.state_dict(), MODEL_PATH)
             print(f"  ✅ New best model saved to {MODEL_PATH} (val_acc={val_acc:.3f})")
+        else:
+            no_improve_epochs += 1
+            print(f"  ⚠️  Val loss tidak membaik ({no_improve_epochs}/{EARLY_STOP_PATIENCE})")
+
+        if no_improve_epochs >= EARLY_STOP_PATIENCE:
+            print("⏹  Early stopping, tidak ada perbaikan val loss.")
+            break
 
     print("Training selesai.")
     print(f"Best val accuracy: {best_val_acc:.3f}")
