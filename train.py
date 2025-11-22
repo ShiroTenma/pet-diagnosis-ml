@@ -156,18 +156,13 @@ def evaluate(model, loader, criterion, device):
         outputs = model(images)
         loss = criterion(outputs, labels)
 
-def main():
-    if torch is None:
-        print("❌ PyTorch (torch) tidak terpasang atau tidak dapat diimpor.")
-        print("   Install dengan: pip install torch torchvision  (atau lihat dokumentasi instalasi PyTorch untuk CUDA)")
-        return
+        running_loss += loss.item() * images.size(0)
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
 
-    device = get_device()
-
-    if not TRAIN_DIR.exists() or not VAL_DIR.exists():
-        print("❌ Folder train/ atau val/ tidak ditemukan.")
-        print("   Pastikan struktur: data/train/<kelas> dan data/val/<kelas>")
-        return
+    epoch_loss = running_loss / total if total > 0 else 0.0
+    epoch_acc = correct / total if total > 0 else 0.0
     return epoch_loss, epoch_acc
 
 
